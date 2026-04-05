@@ -24,4 +24,4 @@ class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    user = db.relationship('User', backref='attendances')
+    user = db.relationship('User', backref=db.backref('attendances', cascade='all, delete-orphan'))
