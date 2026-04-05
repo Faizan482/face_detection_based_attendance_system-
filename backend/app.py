@@ -12,8 +12,14 @@ from datetime import datetime,timedelta
 import jwt
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
-
-
+from liveness import detect_blinks
+from datetime import date
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from io import BytesIO
+from flask import send_file
 
 app = Flask(__name__)
 CORS(app)
@@ -44,7 +50,6 @@ with app.app_context():
     load_known_faces()
 
 # ------------------------- APIs -------------------------
-
 @app.route('/api/enroll', methods=['POST'])
 def enroll():
     data = request.get_json()
@@ -52,37 +57,49 @@ def enroll():
     enrollment_id = data['enrollment_id']
     image_data = data['image']
 
-   # ---------- DUPLICATE ENROLLMENT CHECK ----------
     # Check if enrollment_id already exists
     existing_user = User.query.filter_by(enrollment_id=enrollment_id).first()
     if existing_user:
         return jsonify({
             'success': False,
             'message': 'Enrollment ID already exists. Please go to Mark Attendance.'
-        }), 400  # 400 Bad Request
-    # ------------------------------------------------
+        }), 400
+
     try:
         img_str = image_data.split(',')[1]
         img_bytes = base64.b64decode(img_str)
         img = Image.open(BytesIO(img_bytes))
         img = np.array(img)
     except:
-        return jsonify({'success': False, 'message': 'Invalid image'})
+        return jsonify({'success': False, 'message': 'Invalid image'}), 400
 
     face_encodings = face_recognition.face_encodings(img)
     if len(face_encodings) == 0:
-        return jsonify({'success': False, 'message': 'No face detected'})
+        return jsonify({'success': False, 'message': 'No face detected'}), 400
 
     encoding = face_encodings[0]
+
+    # ----- NEW: Check if this face already exists in the database -----
+    if known_face_encodings:
+        matches = face_recognition.compare_faces(known_face_encodings, encoding, tolerance=0.5)
+        if any(matches):
+            # Find the first matching user
+            match_index = matches.index(True)
+            existing_user_id = known_face_ids[match_index]
+            existing_user = User.query.get(existing_user_id)
+            return jsonify({
+                'success': False,
+                'message': f'Face already registered to {existing_user.name} (Enrollment ID: {existing_user.enrollment_id}). Please use that account.'
+            }), 400
+    # ----------------------------------------------------------------
 
     user = User(name=name, enrollment_id=enrollment_id, face_encoding=encoding.tobytes())
     db.session.add(user)
     db.session.commit()
 
-    load_known_faces()  # Cache update
+    load_known_faces()  # Refresh cache
 
     return jsonify({'success': True, 'message': 'User enrolled successfully'})
-
 
 @app.route('/api/recognize', methods=['POST'])
 def a():
@@ -189,6 +206,7 @@ def filter_attendance():
             'timestamp': rec.timestamp.strftime('%Y-%m-%d %H:%M:%S')
         })
     return jsonify(result)
+
 
 
 ## ------------------------- Authentication & Authorization -------------------------
@@ -360,11 +378,215 @@ def get_my_attendance():
         })
     return jsonify(result)
 
+@app.route('/api/attendance/student/<string:enrollment_id>', methods=['GET'])
+@admin_required
+def get_student_attendance(enrollment_id):
+    user = User.query.filter_by(enrollment_id=enrollment_id).first()
+    if not user:
+        return jsonify({'success': False, 'message': 'Student not found'}), 404
 
+    records = Attendance.query.filter_by(user_id=user.id).order_by(Attendance.timestamp.desc()).all()
+    attendance_list = [{
+        'id': r.id,
+        'timestamp': r.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    } for r in records]
+    return jsonify({
+        'name': user.name,
+        'enrollment_id': user.enrollment_id,
+        'enrollment_date': user.created_at.strftime('%Y-%m-%d'),
+        'attendance': attendance_list
+    })
 
+# Admin endpoint to delete a user (and their attendance records)
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+@admin_required
+def delete_user(user_id):
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'success': False, 'message': 'User not found'}), 404
 
+    # Prevent admin from deleting themselves
+    if user.id == request.user_id:
+        return jsonify({'success': False, 'message': 'You cannot delete your own account'}), 400
 
+    # With cascade set, this automatically deletes all related attendance records
+    db.session.delete(user)
+    db.session.commit()
 
+    # Reload face recognition cache
+    load_known_faces()
+
+    return jsonify({'success': True, 'message': 'User and all attendance records deleted successfully'})
+
+#liveness detection endpoint
+@app.route('/api/recognize_liveness', methods=['POST'])
+def recognize_liveness():
+    data = request.get_json()
+    frames_data = data.get('frames', [])
+
+    print(f"📥 Received {len(frames_data)} frames from frontend")
+
+    if not frames_data:
+        return jsonify({'success': False, 'message': 'No frames provided'}), 400
+
+    frames = []
+    for idx, img_data in enumerate(frames_data):
+        try:
+            img_str = img_data.split(',')[1]
+            img_bytes = base64.b64decode(img_str)
+            img = Image.open(BytesIO(img_bytes))
+            img = np.array(img)
+            frames.append(img)
+        except Exception as e:
+            print(f"⚠️ Frame {idx} decode error: {e}")
+            continue
+
+    print(f"🖼️ Decoded {len(frames)} frames")
+    if frames:
+        print(f"🔍 First frame shape: {frames[0].shape}")
+
+    if len(frames) == 0:
+        return jsonify({'success': False, 'message': 'Could not decode frames'}), 400
+
+    # Liveness detection
+    from liveness import detect_blinks
+    live = detect_blinks(frames, ear_threshold=0.18, consecutive_frames=2)
+    print(f"👁️ Liveness result: {live}")
+
+    if not live:
+        return jsonify({'success': False, 'message': 'Liveness check failed. Please blink.'})
+
+    # Face recognition on the last frame
+    face_encodings = face_recognition.face_encodings(frames[-1])
+    if len(face_encodings) == 0:
+        return jsonify({'success': False, 'message': 'No face detected in final frame'})
+
+    face_encoding = face_encodings[0]
+    matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.5)
+    face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+
+    if len(face_distances) > 0:
+        best_match_index = np.argmin(face_distances)
+        if matches[best_match_index]:
+            user_id = known_face_ids[best_match_index]
+            confidence = 1 - face_distances[best_match_index]
+
+            if confidence > 0.5:
+                # Duplicate check
+                last_attendance = Attendance.query.filter_by(user_id=user_id)\
+                                   .order_by(Attendance.timestamp.desc()).first()
+                if last_attendance and (datetime.utcnow() - last_attendance.timestamp) < timedelta(minutes=DUPLICATE_WINDOW_MINUTES):
+                    return jsonify({
+                        'success': False,
+                        'message': f'Attendance already marked within the last {DUPLICATE_WINDOW_MINUTES} minutes.'
+                    })
+
+                # Mark attendance
+                attendance = Attendance(user_id=user_id)
+                db.session.add(attendance)
+                db.session.commit()
+                user = User.query.get(user_id)
+
+                # Generate JWT token
+                payload = {
+                    'user_id': user.id,
+                    'role': user.role,
+                    'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+                }
+                token = jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+                return jsonify({
+                    'success': True,
+                    'token': token,
+                    'name': user.name,
+                    'enrollment_id': user.enrollment_id,
+                    'role': user.role,
+                    'confidence': float(confidence)
+                })
+
+    return jsonify({'success': False, 'message': 'Unknown face'})
+
+#daily attendance report for admin
+
+@app.route('/api/attendance/daily', methods=['GET'])
+@admin_required
+def get_daily_attendance():
+    target_date_str = request.args.get('date', date.today().isoformat())
+    try:
+        target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'success': False, 'message': 'Invalid date format'}), 400
+
+    students = User.query.filter_by(role='student').all()
+    start = datetime.combine(target_date, datetime.min.time())
+    end = datetime.combine(target_date, datetime.max.time())
+    attendance_records = Attendance.query.filter(Attendance.timestamp.between(start, end)).all()
+    present_user_ids = set(rec.user_id for rec in attendance_records)
+
+    result = []
+    for student in students:
+        rec = next((r for r in attendance_records if r.user_id == student.id), None)
+        result.append({
+            'id': student.id,
+            'name': student.name,
+            'enrollment_id': student.enrollment_id,
+            'present': student.id in present_user_ids,
+            'timestamp': rec.timestamp.strftime('%Y-%m-%d %H:%M:%S') if rec else None
+        })
+    return jsonify(result)
+
+# ---------- Manual Attendance Override ----------
+@app.route('/api/attendance/manual', methods=['POST'])
+@admin_required
+def manual_attendance():
+    data = request.get_json()
+    enrollment_id = data.get('enrollment_id')
+    if not enrollment_id:
+        return jsonify({'success': False, 'message': 'Enrollment ID required'}), 400
+
+    user = User.query.filter_by(enrollment_id=enrollment_id).first()
+    if not user:
+        return jsonify({'success': False, 'message': 'Student not found'}), 404
+
+    # Optional duplicate check (same as recognition)
+    last_attendance = Attendance.query.filter_by(user_id=user.id).order_by(Attendance.timestamp.desc()).first()
+    if last_attendance and (datetime.utcnow() - last_attendance.timestamp) < timedelta(minutes=DUPLICATE_WINDOW_MINUTES):
+        return jsonify({'success': False, 'message': f'Attendance already marked within last {DUPLICATE_WINDOW_MINUTES} minutes'}), 400
+
+    attendance = Attendance(user_id=user.id)
+    db.session.add(attendance)
+    db.session.commit()
+    return jsonify({'success': True, 'message': f'Attendance marked for {user.name}'})
+
+# ---------- PDF Export ----------
+@app.route('/api/attendance/export/pdf', methods=['GET'])
+@admin_required
+def export_attendance_pdf():
+    records = Attendance.query.order_by(Attendance.timestamp.desc()).all()
+    data = [[str(rec.id), rec.user.name, rec.user.enrollment_id, rec.timestamp.strftime('%Y-%m-%d %H:%M:%S')] for rec in records]
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+    elements = []
+
+    styles = getSampleStyleSheet()
+    title = Paragraph("Attendance Records", styles['Title'])
+    elements.append(title)
+    elements.append(Spacer(1, 12))
+
+    table_data = [['ID', 'Name', 'Enrollment ID', 'Timestamp']] + data
+    table = Table(table_data)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+    ]))
+    elements.append(table)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return send_file(buffer, as_attachment=True, download_name='attendance_report.pdf', mimetype='application/pdf')
 
 
 if __name__ == '__main__':
